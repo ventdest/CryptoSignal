@@ -5,7 +5,7 @@ import requests
 st.set_page_config(page_title="Scanner Capitulation Crypto", layout="wide")
 
 st.title("📊 Dashboard de Screening - Capitulation Crypto (Top 100 Crypto Pure)")
-st.markdown("Analyse automatique des 100 vraies cryptomonnaies les plus liquides (données marché OKX).")
+st.markdown("Analyse automatique des 100 vraies cryptomonnaies les plus liquides (données marché KuCoin).")
 
 mode = st.radio(
     "Sélectionne l'horizon :",
@@ -13,7 +13,8 @@ mode = st.radio(
     horizontal=True
 )
 
-BASE_URL = "https://okx.com"
+BASE_URL = "https://kucoin.com"
+HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
 
 EXCLUDED_KEYWORDS = [
     'UP', 'DOWN', 'BEAR', 'BULL', '3L', '3S', '5L', '5S',
@@ -23,54 +24,53 @@ EXCLUDED_KEYWORDS = [
 
 @st.cache_data(ttl=3600)
 def get_top_symbols(limit=100):
-    url = f"{BASE_URL}/tickers?instType=SPOT"
+    url = f"{BASE_URL}/allTickers"
     try:
-        response = requests.get(url, timeout=10)
+        response = requests.get(url, headers=HEADERS, timeout=10)
         if response.status_code == 200:
             res_json = response.json()
-            if res_json.get("code") == "0":
-                data = res_json.get("data", [])
+            if res_json.get("code") == "200000":
+                tickers = res_json.get("data", {}).get("ticker", [])
                 usdt_pairs = []
-                for item in data:
-                    inst_id = item['instId']  # Format OKX : BTC-USDT
-                    if inst_id.endswith('-USDT'):
-                        base = inst_id.split('-')[0]
+                for item in tickers:
+                    symbol = item.get('symbol', '')  # Format KuCoin : BTC-USDT
+                    if symbol.endswith('-USDT'):
+                        base = symbol.split('-')[0]
                         if not any(ex in base for ex in EXCLUDED_KEYWORDS):
                             usdt_pairs.append(item)
                 
-                # Tri par volume en USDT sur 24h (volCcy24h)
-                usdt_pairs = sorted(usdt_pairs, key=lambda x: float(x.get('volCcy24h', 0)), reverse=True)
-                return [item['instId'] for item in usdt_pairs[:limit]], None
-            return None, f"Erreur API OKX : {res_json.get('msg')}"
+                # Tri par volume en USDT sur 24h (volValue)
+                usdt_pairs = sorted(usdt_pairs, key=lambda x: float(x.get('volValue') or 0), reverse=True)
+                return [item['symbol'] for item in usdt_pairs[:limit]], None
+            return None, f"Erreur API KuCoin : {res_json.get('msg')}"
         return None, f"Erreur HTTP {response.status_code} (Top 100)"
     except Exception as e:
         return None, f"Exception réseau (Top 100) : {str(e)}"
 
 @st.cache_data(ttl=300)
-def get_klines(inst_id, bar, limit=300):
-    # OKX utilise 4H, 1Dutc, 1Wutc et limite à 300 bougies par requête
-    url = f"{BASE_URL}/candles?instId={inst_id}&bar={bar}&limit={limit}"
+def get_klines(symbol, kline_type):
+    # KuCoin utilise 4hour, 1day, 1week et renvoie jusqu'à 1500 bougies
+    url = f"{BASE_URL}/candles?type={kline_type}&symbol={symbol}"
     try:
-        response = requests.get(url, timeout=10)
+        response = requests.get(url, headers=HEADERS, timeout=10)
         if response.status_code == 200:
             res_json = response.json()
-            if res_json.get("code") == "0":
+            if res_json.get("code") == "200000":
                 data = res_json.get("data", [])
                 if isinstance(data, list) and len(data) > 0:
-                    # OKX renvoie les bougies de la plus récente à la plus ancienne -> on inverse [::-1]
+                    # KuCoin renvoie de la plus récente à la plus ancienne -> on inverse [::-1]
                     data = data[::-1]
                     df = pd.DataFrame(data, columns=[
-                        'timestamp', 'open', 'high', 'low', 'close',
-                        'volume', 'volCcy', 'volCcyQuote', 'confirm'
+                        'timestamp', 'open', 'close', 'high', 'low', 'volume', 'turnover'
                     ])
                     for col in ['close', 'high', 'low', 'volume']:
                         df[col] = df[col].astype(float)
                     return df, None
-                return None, f"Données vides pour {inst_id} ({bar})"
-            return None, f"API OKX sur {inst_id} ({bar}) : {res_json.get('msg')}"
-        return None, f"HTTP {response.status_code} sur {inst_id} ({bar})"
+                return None, f"Données vides pour {symbol} ({kline_type})"
+            return None, f"API KuCoin sur {symbol} ({kline_type}) : {res_json.get('msg')}"
+        return None, f"HTTP {response.status_code} sur {symbol} ({kline_type})"
     except Exception as e:
-        return None, f"Exception sur {inst_id} ({bar}) : {str(e)}"
+        return None, f"Exception sur {symbol} ({kline_type}) : {str(e)}"
 
 def compute_indicators(df, rsi_len=14):
     delta = df['close'].diff()
@@ -112,9 +112,9 @@ if st.button("Lancer le Scan Dynamique du Top 100 🚀"):
         progress_bar.progress((i + 1) / total)
         
         try:
-            tf_fast, tf_slow = ("4H", "1Dutc") if is_short_term else ("1Dutc", "1Wutc")
-            df_fast, err_fast = get_klines(symbol, tf_fast, limit=300)
-            df_slow, err_slow = get_klines(symbol, tf_slow, limit=300)
+            tf_fast, tf_slow = ("4hour", "1day") if is_short_term else ("1day", "1week")
+            df_fast, err_fast = get_klines(symbol, tf_fast)
+            df_slow, err_slow = get_klines(symbol, tf_slow)
             
             if err_fast:
                 errors_log.append(err_fast)
