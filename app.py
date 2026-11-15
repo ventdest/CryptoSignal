@@ -1,76 +1,94 @@
 import streamlit as st
 import pandas as pd
 import requests
+import time
 
 st.set_page_config(page_title="Scanner Capitulation Crypto", layout="wide")
 
 st.title("📊 Dashboard de Screening - Capitulation Crypto (Top 100 Crypto Pure)")
-st.markdown("Analyse automatique des 100 vraies cryptomonnaies les plus liquides (données marché KuCoin).")
+st.markdown("Analyse automatique des cryptomonnaies les plus liquides (données marché Coinbase).")
 
 mode = st.radio(
     "Sélectionne l'horizon :",
-    ["Court Terme (4H / Daily)", "Long Terme (Weekly / Monthly)"],
+    ["Court Terme (6H / Daily)", "Long Terme (Weekly / Monthly)"],
     horizontal=True
 )
 
-BASE_URL = "https://kucoin.com"
-HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+BASE_URL = "https://coinbase.com"
+HEADERS = {"User-Agent": "Mozilla/5.0"}
 
 EXCLUDED_KEYWORDS = [
-    'UP', 'DOWN', 'BEAR', 'BULL', '3L', '3S', '5L', '5S',
-    'USDC', 'FDUSD', 'TUSD', 'BUSD', 'USD1', 'USDE', 'RLUSD', 'DAI', 'EUR', 'GBP', 'AUD', 'PYUSD',
-    'PAXG', 'XAU', 'XAG', 'XAUT'
+    'USDC', 'FDUSD', 'TUSD', 'BUSD', 'USD1', 'USDE', 'RLUSD', 'DAI', 'EUR', 'GBP', 'AUD', 'PYUSD', 'GUSD', 'PAX',
+    'PAXG', 'XAU', 'XAG', 'XAUT', 'WBTC', 'WETH', 'CBETH', 'STETH'
 ]
 
 @st.cache_data(ttl=3600)
-def get_top_symbols(limit=100):
-    url = f"{BASE_URL}/allTickers"
+def get_top_symbols(limit=80):
     try:
-        response = requests.get(url, headers=HEADERS, timeout=10)
-        if response.status_code == 200:
-            res_json = response.json()
-            if res_json.get("code") == "200000":
-                tickers = res_json.get("data", {}).get("ticker", [])
-                usdt_pairs = []
-                for item in tickers:
-                    symbol = item.get('symbol', '')  # Format KuCoin : BTC-USDT
-                    if symbol.endswith('-USDT'):
-                        base = symbol.split('-')[0]
-                        if not any(ex in base for ex in EXCLUDED_KEYWORDS):
-                            usdt_pairs.append(item)
-                
-                # Tri par volume en USDT sur 24h (volValue)
-                usdt_pairs = sorted(usdt_pairs, key=lambda x: float(x.get('volValue') or 0), reverse=True)
-                return [item['symbol'] for item in usdt_pairs[:limit]], None
-            return None, f"Erreur API KuCoin : {res_json.get('msg')}"
-        return None, f"Erreur HTTP {response.status_code} (Top 100)"
+        # Récupère toutes les paires disponibles sur Coinbase
+        res_prod = requests.get(f"{BASE_URL}/products", headers=HEADERS, timeout=10)
+        if res_prod.status_code != 200:
+            return None, f"Erreur HTTP {res_prod.status_code} sur /products"
+        
+        products = res_prod.json()
+        valid_pairs = []
+        for p in products:
+            # Coinbase utilise USD ou USDT (USD est le plus liquide sur Coinbase)
+            if p.get('quote_currency') == 'USD' and p.get('status') == 'online' and not p.get('trading_disabled'):
+                base = p.get('base_currency', '')
+                if base not in EXCLUDED_KEYWORDS:
+                    valid_pairs.append(p['id'])  # Format : BTC-USD
+
+        # Récupère les stats 24h pour trier par volume
+        res_stats = requests.get(f"{BASE_URL}/products/stats", headers=HEADERS, timeout=10)
+        if res_stats.status_code == 200:
+            stats_data = res_stats.json()
+            ranked = []
+            for pair_id in valid_pairs:
+                if pair_id in stats_data:
+                    s = stats_data[pair_id].get('stats_24hour', {})
+                    vol_usd = float(s.get('volume', 0)) * float(s.get('last', 0))
+                    ranked.append((pair_id, vol_usd))
+            ranked.sort(key=lambda x: x[1], reverse=True)
+            return [x[0] for x in ranked[:limit]], None
+        
+        return valid_pairs[:limit], None
     except Exception as e:
         return None, f"Exception réseau (Top 100) : {str(e)}"
 
 @st.cache_data(ttl=300)
-def get_klines(symbol, kline_type):
-    # KuCoin utilise 4hour, 1day, 1week et renvoie jusqu'à 1500 bougies
-    url = f"{BASE_URL}/candles?type={kline_type}&symbol={symbol}"
+def get_klines(product_id, granularity):
+    # Coinbase utilise la granularité en secondes : 21600 (6H), 86400 (1D)
+    # Limite max par appel : 300 bougies
+    url = f"{BASE_URL}/products/{product_id}/candles?granularity={granularity}"
     try:
         response = requests.get(url, headers=HEADERS, timeout=10)
         if response.status_code == 200:
-            res_json = response.json()
-            if res_json.get("code") == "200000":
-                data = res_json.get("data", [])
-                if isinstance(data, list) and len(data) > 0:
-                    # KuCoin renvoie de la plus récente à la plus ancienne -> on inverse [::-1]
-                    data = data[::-1]
-                    df = pd.DataFrame(data, columns=[
-                        'timestamp', 'open', 'close', 'high', 'low', 'volume', 'turnover'
-                    ])
-                    for col in ['close', 'high', 'low', 'volume']:
-                        df[col] = df[col].astype(float)
-                    return df, None
-                return None, f"Données vides pour {symbol} ({kline_type})"
-            return None, f"API KuCoin sur {symbol} ({kline_type}) : {res_json.get('msg')}"
-        return None, f"HTTP {response.status_code} sur {symbol} ({kline_type})"
+            data = response.json()
+            if isinstance(data, list) and len(data) > 0:
+                # Coinbase renvoie [timestamp, low, high, open, close, volume] du plus récent au plus ancien
+                data = data[::-1]
+                df = pd.DataFrame(data, columns=['timestamp', 'low', 'high', 'open', 'close', 'volume'])
+                for col in ['close', 'high', 'low', 'volume']:
+                    df[col] = df[col].astype(float)
+                return df, None
+            return None, f"Données vides pour {product_id}"
+        return None, f"HTTP {response.status_code} sur {product_id} : {response.text[:100]}"
     except Exception as e:
-        return None, f"Exception sur {symbol} ({kline_type}) : {str(e)}"
+        return None, f"Exception sur {product_id} : {str(e)}"
+
+def resample_weekly(df_daily):
+    df = df_daily.copy()
+    df['date'] = pd.to_datetime(df['timestamp'], unit='s')
+    df.set_index('date', inplace=True)
+    df_w = df.resample('W').agg({
+        'open': 'first',
+        'high': 'max',
+        'low': 'min',
+        'close': 'last',
+        'volume': 'sum'
+    }).dropna()
+    return df_w
 
 def compute_indicators(df, rsi_len=14):
     delta = df['close'].diff()
@@ -88,15 +106,15 @@ def compute_indicators(df, rsi_len=14):
     df['ath_cycle'] = df['high'].max()
     return df
 
-if st.button("Lancer le Scan Dynamique du Top 100 🚀"):
-    symbols, top_error = get_top_symbols(100)
+if st.button("Lancer le Scan Dynamique 🚀"):
+    symbols, top_error = get_top_symbols(60)
     
     if top_error:
         st.warning(f"⚠️ Liste dynamique indisponible ({top_error}). Utilisation de la liste de secours.")
         symbols = [
-            "BTC-USDT", "ETH-USDT", "SOL-USDT", "XRP-USDT", "ADA-USDT",
-            "DOGE-USDT", "AVAX-USDT", "LINK-USDT", "SUI-USDT", "ARB-USDT",
-            "ONDO-USDT", "OP-USDT", "RENDER-USDT", "STX-USDT", "TIA-USDT", "WIF-USDT"
+            "BTC-USD", "ETH-USD", "SOL-USD", "XRP-USD", "ADA-USD",
+            "DOGE-USD", "AVAX-USD", "LINK-USD", "SUI-USD", "ARB-USD",
+            "ONDO-USD", "OP-USD", "RENDER-USD", "STX-USD", "TIA-USD", "WIF-USD"
         ]
     
     results = []
@@ -107,21 +125,28 @@ if st.button("Lancer le Scan Dynamique du Top 100 🚀"):
     is_short_term = "Court Terme" in mode
     
     for i, symbol in enumerate(symbols):
-        clean_name = symbol.replace("-", "")
+        clean_name = symbol.replace("-USD", "")
         status_text.text(f"Analyse en cours ({i+1}/{total}) : {clean_name}...")
         progress_bar.progress((i + 1) / total)
         
+        # Respecte la limite de requêtes par seconde de Coinbase (10 req/s max)
+        time.sleep(0.15)
+        
         try:
-            tf_fast, tf_slow = ("4hour", "1day") if is_short_term else ("1day", "1week")
-            df_fast, err_fast = get_klines(symbol, tf_fast)
-            df_slow, err_slow = get_klines(symbol, tf_slow)
+            if is_short_term:
+                df_fast, err_fast = get_klines(symbol, 21600)  # 6H (4H n'existe pas nativement sur Coinbase)
+                df_slow, err_slow = get_klines(symbol, 86400)  # 1D
+            else:
+                df_fast, err_fast = get_klines(symbol, 86400)  # 1D
+                err_slow = None
+                df_slow = resample_weekly(df_fast) if df_fast is not None else None
             
             if err_fast:
                 errors_log.append(err_fast)
             if err_slow:
                 errors_log.append(err_slow)
                 
-            if df_fast is not None and len(df_fast) > 200 and df_slow is not None and len(df_slow) > 50:
+            if df_fast is not None and len(df_fast) > 200 and df_slow is not None and len(df_slow) > 30:
                 df_fast = compute_indicators(df_fast)
                 df_slow = compute_indicators(df_slow)
                 
@@ -142,17 +167,17 @@ if st.button("Lancer le Scan Dynamique du Top 100 🚀"):
                     score = sum([c1, c2, c3, c4, c5, c6, c7, c8, c9])
                     results.append({
                         "Actif": clean_name,
-                        "Prix": cf['close'],
+                        "Prix ($)": cf['close'],
                         "Score /9": f"{score}/9",
-                        "C1 (ATH 365j -50%)": "✅" if c1 else "❌",
-                        "C2 (RSI 4H <35)": f"{round(cf['rsi'], 1)} {'✅' if c2 else '❌'}",
-                        "C3 (Sous MA50/100 4H)": "✅" if c3 else "❌",
-                        "C4 (Sous MA200 4H)": "✅" if c4 else "❌",
+                        "C1 (ATH 300j -50%)": "✅" if c1 else "❌",
+                        "C2 (RSI 6H <35)": f"{round(cf['rsi'], 1)} {'✅' if c2 else '❌'}",
+                        "C3 (Sous MA50/100 6H)": "✅" if c3 else "❌",
+                        "C4 (Sous MA200 6H)": "✅" if c4 else "❌",
                         "C5 (RSI Daily <40)": f"{round(cs['rsi'], 1)} {'✅' if c5 else '❌'}",
                         "C6 (Sous MA20/50 D)": "✅" if c6 else "❌",
-                        "C7 (Div 4H)": "✅" if c7 else "❌",
+                        "C7 (Div 6H)": "✅" if c7 else "❌",
                         "C8 (Div Daily)": "✅" if c8 else "❌",
-                        "C9 (Vol Cap 4H)": "🔥 Oui" if c9 else "❌",
+                        "C9 (Vol Cap 6H)": "🔥 Oui" if c9 else "❌",
                     })
                 else:
                     c1 = cs['close'] <= cs['ath_cycle'] * 0.5
@@ -168,9 +193,9 @@ if st.button("Lancer le Scan Dynamique du Top 100 🚀"):
                     score = sum([c1, c2, c3, c4, c5, c6, c7, c8, c9])
                     results.append({
                         "Actif": clean_name,
-                        "Prix": cf['close'],
+                        "Prix ($)": cf['close'],
                         "Score /9": f"{score}/9",
-                        "C1 (ATH Cycle -50%)": "✅" if c1 else "❌",
+                        "C1 (ATH 300j -50%)": "✅" if c1 else "❌",
                         "C2 (RSI Daily <30)": f"{round(cf['rsi'], 1)} {'✅' if c2 else '❌'}",
                         "C3 (Sous MA100 D)": "✅" if c3 else "❌",
                         "C4 (Sous MA200 D)": "✅" if c4 else "❌",
@@ -191,7 +216,3 @@ if st.button("Lancer le Scan Dynamique du Top 100 🚀"):
         st.dataframe(df_res, use_container_width=True)
     else:
         st.error("Impossible de récupérer les données pour le moment.")
-        if errors_log:
-            with st.expander("🔍 Détails des erreurs rencontrées", expanded=True):
-                for err in errors_log[:10]:
-                    st.code(err)
